@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spider-Man: Web of Twilight - WoS Physics Update</title>
+    <style>
+        body, html {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            overflow: hidden; background-color: #000;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+
+        #game-canvas { display: block; width: 100%; height: 100%; }
+
+        /* UI Overlays */
+        .overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; justify-content: center; align-items: center;
+            color: white; z-index: 10;
+        }
+
+        #start-screen { background: rgba(0, 0, 0, 0.9); cursor: pointer; z-index: 50; }
+        #start-screen h1 { font-size: 3rem; animation: pulse 1.5s infinite; }
+
+        /* Miles Morales / WoS Style Menu */
+        #main-menu {
+            display: none; background: rgba(10, 10, 15, 0.8);
+            backdrop-filter: blur(10px); flex-direction: column; z-index: 40;
+        }
+
+        .menu-content {
+            text-align: left; margin-left: -40%; padding: 40px;
+            border-left: 4px solid #d92525;
+            background: linear-gradient(90deg, rgba(0,0,0,0.9) 0%, rgba(0,0,0,0) 100%);
+        }
+
+        .menu-content h1 {
+            font-size: 4rem; margin: 0 0 10px 0; text-transform: uppercase;
+            letter-spacing: 2px; color: #ff3333;
+        }
+
+        .menu-btn {
+            display: block; background: none; border: none; color: white;
+            font-size: 1.8rem; margin: 15px 0; cursor: pointer;
+            transition: all 0.2s ease; text-transform: uppercase; font-weight: bold; opacity: 0.7;
+        }
+        .menu-btn:hover { color: #ff4b4b; transform: translateX(10px); opacity: 1; }
+
+        /* HUD */
+        #hud { display: none; pointer-events: none; z-index: 20; }
+        
+        #speed-lines {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            box-shadow: inset 0 0 100px rgba(255,255,255,0);
+            transition: box-shadow 0.2s; pointer-events: none;
+        }
+
+        #health-bar-container {
+            position: absolute; top: 30px; left: 30px; width: 300px; height: 15px;
+            background: rgba(255, 255, 255, 0.2); border: 2px solid #fff;
+            border-radius: 8px; overflow: hidden; transform: skewX(-20deg);
+        }
+
+        #health-bar {
+            width: 100%; height: 100%; background: linear-gradient(90deg, #cc0000, #ff4b4b);
+        }
+
+        #combo-counter {
+            position: absolute; top: 30px; right: 50px; font-size: 3rem;
+            font-weight: 900; font-style: italic; color: #fff;
+            text-shadow: 3px 3px 0 #000, -2px -2px 0 #ff4b4b; transform: skewX(-10deg);
+        }
+
+        @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.05); } 100% { transform: scale(1); } }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="start-screen" class="overlay" onclick="initGame()">
+        <h1>Press to Start</h1>
+    </div>
+
+    <div id="main-menu" class="overlay">
+        <div class="menu-content">
+            <h1>Web of Twilight</h1>
+            <button class="menu-btn" onclick="startGame()">Continue</button>
+            <button class="menu-btn">Settings</button>
+        </div>
+    </div>
+
+    <div id="hud" class="overlay">
+        <div id="speed-lines"></div>
+        <div id="health-bar-container"><div id="health-bar"></div></div>
+        <div id="combo-counter"></div>
+    </div>
+
+    <div id="game-canvas"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- Core Variables ---
+        let scene, camera, renderer, clock, mixer;
+        let playerModel, activeAction, previousAction;
+        let animations = {};
+        let webLineMesh; // Procedural Web Line
+        
+        let gameState = 'start';
+        let combo = 0, comboTimer = 0;
+
+        // --- Enums & States ---
+        const PlayerStates = {
+            IDLE: 'idle', WALK: 'walk', JUMP: 'jump', 
+            FALLING: 'falling', SWING_START: 'swing_start', 
+            SWINGING: 'swing', FIGHT: 'fight'
+        };
+
+        const player = {
+            pos: new THREE.Vector3(0, 50, 0),
+            vel: new THREE.Vector3(0, 0, 0),
+            state: PlayerStates.FALLING,
+            isGrounded: false,
+            modelOffset: new THREE.Vector3(0, -1, 0)
+        };
+
+        const physics = {
+            gravity: -45.0,
+            drag: 0.98,
+            airDrag: 0.995,
+            terminalVelocity: -100
+        };
+
+        const swingData = {
+            active: false,
+            anchor: new THREE.Vector3(),
+            ropeLength: 0,
+            webWrapTarget: null // Placeholder for advanced wrapping logic
+        };
+
+        // --- Input State ---
+        const input = {
+            forward: false, backward: false, left: false, right: false,
+            jump: false, jumpPressed: false,
+            attack: false, attackPressed: false,
+            swing: false, swingPressed: false,
+            camX: Math.PI, camY: 0.2 // Starting camera angles
+        };
+
+        // --- DOM Elements ---
+        const ui = {
+            start: document.getElementById('start-screen'),
+            menu: document.getElementById('main-menu'),
+            hud: document.getElementById('hud'),
+            combo: document.getElementById('combo-counter'),
+            speed: document.getElementById('speed-lines')
+        };
+
+        window.initGame = function() {
+            ui.start.style.display = 'none';
+            ui.menu.style.display = 'flex';
+            setupEngine();
+        };
+
+        window.startGame = function() {
+            ui.menu.style.display = 'none';
+            ui.hud.style.display = 'block';
+            gameState = 'playing';
+            clock.start();
+            document.body.requestPointerLock();
+            animate();
+        };
+
+        function setupEngine() {
+            clock = new THREE.Clock();
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x90C8FF);
+            scene.fog = new THREE.FogExp2(0x90C8FF, 0.003); // Manhattan haze
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 2000);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.getElementById('game-canvas').appendChild(renderer.domElement);
+
+            // Lighting
+            const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444455, 0.6);
+            scene.add(hemiLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffeedd, 1.2);
+            dirLight.position.set(200, 300, 100);
+            dirLight.castShadow = true;
+            dirLight.shadow.camera.top = 200;
+            dirLight.shadow.camera.bottom = -200;
+            dirLight.shadow.camera.left = -200;
+            dirLight.shadow.camera.right = 200;
+            dirLight.shadow.mapSize.width = 2048;
+            dirLight.shadow.mapSize.height = 2048;
+            scene.add(dirLight);
+
+            createManhattanCity();
+            loadPlayerModel();
+            createWebLine();
+            setupInputListeners();
+            renderer.render(scene, camera);
+        }
+
+        // --- Procedural Web Line ---
+        function createWebLine() {
+            const material = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 3 });
+            const geometry = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+            webLineMesh = new THREE.Line(geometry, material);
+            webLineMesh.visible = false;
+            scene.add(webLineMesh);
+        }
+
+        // --- Manhattan City Generation ---
+        function createManhattanCity() {
+            // Ground
+            const groundGeo = new THREE.PlaneGeometry(3000, 3000);
+            const groundMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.9 });
+            const ground = new THREE.Mesh(groundGeo, groundMat);
+            ground.rotation.x = -Math.PI / 2;
+            ground.receiveShadow = true;
+            scene.add(ground);
+
+            
+            
+            // Grid layout params
+            const blockSize = 80;
+            const streetWidth = 30;
+            const gridSize = 15;
+            const startOffset = -((blockSize + streetWidth) * gridSize) / 2;
+
+            const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+            
+            // Glass & concrete materials
+            const matConcrete = new THREE.MeshStandardMaterial({ color: 0x555555, roughness: 0.8 });
+            const matGlass = new THREE.MeshStandardMaterial({ color: 0x223344, roughness: 0.2, metalness: 0.8 });
+
+            const cityGroup = new THREE.Group();
+
+            for (let x = 0; x < gridSize; x++) {
+                for (let z = 0; z < gridSize; z++) {
+                    // Skip some blocks for parks/plazas
+                    if (Math.random() > 0.9) continue;
+
+                    const isSkyscraper = Math.random() > 0.7;
+                    const height = isSkyscraper ? (100 + Math.random() * 250) : (30 + Math.random() * 60);
+                    
+                    const mat = isSkyscraper ? matGlass : matConcrete;
+                    const building = new THREE.Mesh(boxGeo, mat);
+                    
+                    // Slightly vary building widths inside the block
+                    const bWidth = blockSize - (Math.random() * 10);
+                    const bDepth = blockSize - (Math.random() * 10);
+
+                    building.scale.set(bWidth, height, bDepth);
+                    
+                    const posX = startOffset + x * (blockSize + streetWidth) + (blockSize/2);
+                    const posZ = startOffset + z * (blockSize + streetWidth) + (blockSize/2);
+                    
+                    building.position.set(posX, height / 2, posZ);
+                    building.castShadow = true;
+                    building.receiveShadow = true;
+                    
+                    // Mark as web-attachable
+                    building.userData.isBuilding = true;
+                    cityGroup.add(building);
+                }
+            }
+            scene.add(cityGroup);
+            
+            // Central Park placeholder
+            const parkGeo = new THREE.PlaneGeometry(400, 600);
+            const parkMat = new THREE.MeshStandardMaterial({color: 0x2d4c1e});
+            const park = new THREE.Mesh(parkGeo, parkMat);
+            park.rotation.x = -Math.PI/2;
+            park.position.y = 0.1;
+            scene.add(park);
+        }
+
+        // --- Model Loader ---
+        function loadPlayerModel() {
+            const loader = new GLTFLoader();
+            loader.load('./spiderman_classic_textured_rigged.glb', (gltf) => {
+                playerModel = gltf.scene;
+                playerModel.scale.set(1.2, 1.2, 1.2);
+                playerModel.traverse(c => { if (c.isMesh) c.castShadow = true; });
+                scene.add(playerModel);
+
+                mixer = new THREE.AnimationMixer(playerModel);
+                
+                // Extract animations safely
+                const clipNames = ['idle', 'walk', 'jump', 'swing', 'fight', 'falling'];
+                if(gltf.animations.length > 0) {
+                    gltf.animations.forEach(clip => {
+                        const name = clip.name.toLowerCase();
+                        let mappedName = clipNames.find(n => name.includes(n)) || name;
+                        animations[mappedName] = mixer.clipAction(clip);
+                    });
+                    
+                    // Fallbacks
+                    clipNames.forEach(n => {
+                        if(!animations[n]) animations[n] = mixer.clipAction(gltf.animations[0]);
+                    });
+                }
+
+                changeState(PlayerStates.FALLING);
+            });
+        }
+
+        function changeState(newState, crossFade = 0.2) {
+            if (player.state === newState) return;
+            player.state = newState;
+
+            let animName = newState;
+            // Map states to animations if different
+            if (newState === PlayerStates.SWING_START) animName = 'swing';
+            
+            if (animations[animName]) {
+                previousAction = activeAction;
+                activeAction = animations[animName];
+                if (previousAction && previousAction !== activeAction) {
+                    previousAction.fadeOut(crossFade);
+                }
+                activeAction.reset().fadeIn(crossFade).play();
+            }
+        }
+
+        // --- Input & Gamepad ---
+        function setupInputListeners() {
+            document.addEventListener('keydown', (e) => {
+                switch(e.code) {
+                    case 'KeyW': input.forward = true; break;
+                    case 'KeyS': input.backward = true; break;
+                    case 'KeyA': input.left = true; break;
+                    case 'KeyD': input.right = true; break;
+                    case 'Space': 
+                        if(!input.jump) input.jumpPressed = true; 
+                        input.jump = true; break;
+                    case 'KeyE': 
+                        if(!input.swing) input.swingPressed = true;
+                        input.swing = true; break;
+                }
+            });
+            document.addEventListener('keyup', (e) => {
+                switch(e.code) {
+                    case 'KeyW': input.forward = false; break;
+                    case 'KeyS': input.backward = false; break;
+                    case 'KeyA': input.left = false; break;
+                    case 'KeyD': input.right = false; break;
+                    case 'Space': input.jump = false; break;
+                    case 'KeyE': input.swing = false; break;
+                }
+            });
+
+            document.addEventListener('mousemove', (e) => {
+                if(document.pointerLockElement) {
+                    input.camX -= e.movementX * 0.002;
+                    input.camY -= e.movementY * 0.002;
+                    // Clamp vertical look
+                    input.camY = Math.max(-0.5, Math.min(Math.PI/2 - 0.1, input.camY));
+                }
+            });
+            
+            document.addEventListener('mousedown', (e) => {
+                if(e.button === 0 && document.pointerLockElement) {
+                    if(!input.swing) input.swingPressed = true;
+                    input.swing = true;
+                }
+            });
+            document.addEventListener('mouseup', (e) => {
+                if(e.button === 0) input.swing = false;
+            });
+        }
+
+        function updateGamepad() {
+            input.jumpPressed = false;
+            input.swingPressed = false;
+            input.attackPressed = false;
+
+            const gamepads = navigator.getGamepads();
+            if (!gamepads[0]) return;
+            const gp = gamepads[0];
+
+            // R2 (Swing)
+            const r2 = gp.buttons[7].value > 0.1;
+            if (r2 && !input.swing) input.swingPressed = true;
+            input.swing = r2;
+
+            // X (Jump)
+            const xBtn = gp.buttons[0].pressed;
+            if (xBtn && !input.jump) input.jumpPressed = true;
+            input.jump = xBtn;
+
+            // Square (Attack)
+            const sqBtn = gp.buttons[2].pressed;
+            if (sqBtn && !input.attack) input.attackPressed = true;
+            input.attack = sqBtn;
+
+            // Sticks
+            input.right = gp.axes[0] > 0.2;
+            input.left = gp.axes[0] < -0.2;
+            input.backward = gp.axes[1] > 0.2;
+            input.forward = gp.axes[1] < -0.2;
+
+            if (Math.abs(gp.axes[2]) > 0.2) input.camX -= gp.axes[2] * 0.04;
+            if (Math.abs(gp.axes[3]) > 0.2) input.camY -= gp.axes[3] * 0.04;
+            input.camY = Math.max(-0.5, Math.min(Math.PI/2 - 0.1, input.camY));
+        }
+
+        // --- Web of Shadows Physics Engine ---
+        function attachWeb() {
+            // Raycast logic: Find a building ahead and slightly up
+            const dir = new THREE.Vector3();
+            camera.getWorldDirection(dir);
+            dir.y += 0.5; // Aim up
+            dir.normalize();
+
+            // Broaden raycast slightly to simulate auto-aim
+            const raycaster = new THREE.Raycaster(player.pos, dir, 0, 150);
+            
+            // Only intersect objects marked as buildings
+            const buildings = scene.children.filter(c => c.type === "Group")[0]?.children || [];
+            const hits = raycaster.intersectObjects(buildings);
+
+            if (hits.length > 0) {
+                swingData.anchor.copy(hits[0].point);
+            } else {
+                // WoS "Sky Attachment" fallback if no building is hit perfectly
+                swingData.anchor.copy(player.pos).add(dir.multiplyScalar(80));
+                swingData.anchor.y = Math.max(swingData.anchor.y, player.pos.y + 40);
+            }
+
+            swingData.ropeLength = player.pos.distanceTo(swingData.anchor) * 0.9; // Slight tension pull
+            swingData.active = true;
+            changeState(PlayerStates.SWING_START, 0.1);
+        }
+
+        function updatePhysics(dt) {
+            // Cap delta to prevent physics explosions
+            dt = Math.min(dt, 0.05);
+
+            const camDir = new THREE.Vector3();
+            camera.getWorldDirection(camDir);
+            camDir.y = 0; camDir.normalize();
+            
+            const camRight = new THREE.Vector3().crossVectors(camDir, new THREE.Vector3(0,1,0)).normalize();
+
+            // Gravity
+            player.vel.y += physics.gravity * dt;
+
+            // --- Swing Physics (Point-to-Point Constraint) ---
+            if (input.swingPressed) {
+                attachWeb();
+            }
+
+            if (swingData.active && input.swing) {
+                changeState(PlayerStates.SWINGING);
+                
+                // Vector from anchor to player
+                const ropeVec = new THREE.Vector3().subVectors(player.pos, swingData.anchor);
+                const currentDist = ropeVec.length();
+
+                if (currentDist > swingData.ropeLength) {
+                    // 1. Position Constraint (pull back to arc)
+                    ropeVec.normalize();
+                    player.pos.copy(swingData.anchor).add(ropeVec.clone().multiplyScalar(swingData.ropeLength));
+
+                    // 2. Velocity Constraint (remove outward velocity)
+                    const radialVel = player.vel.dot(ropeVec);
+                    if (radialVel > 0) {
+                        player.vel.sub(ropeVec.clone().multiplyScalar(radialVel));
+                    }
+
+                    // 3. Tension Force (Counteract gravity stretching the rope)
+                    const gravityVec = new THREE.Vector3(0, physics.gravity, 0);
+                    const tensionMag = -gravityVec.dot(ropeVec);
+                    if (tensionMag > 0) {
+                        const tensionForce = ropeVec.clone().multiplyScalar(tensionMag * dt);
+                        player.vel.add(tensionForce);
+                    }
+
+                    // 4. WoS Angular Acceleration (Bottom of the arc boost)
+                    // If the rope is pointing mostly down, add forward momentum
+                    const dotDown = ropeVec.dot(new THREE.Vector3(0, -1, 0));
+                    if (dotDown > 0.85) {
+                        // Project current velocity onto horizontal plane and boost
+                        const horizontalVel = player.vel.clone();
+                        horizontalVel.y = 0;
+                        if(horizontalVel.lengthSq() > 1) {
+                            player.vel.add(horizontalVel.normalize().multiplyScalar(15 * dt));
+                        }
+                    }
+
+                    // 5. WoS Swing Steering Assistance
+                    // Allow pushing left/right/forward on the stick to modify velocity tangentially
+                    let steerAccel = new THREE.Vector3();
+                    if (input.forward) steerAccel.add(camDir);
+                    if (input.backward) steerAccel.sub(camDir);
+                    if (input.right) steerAccel.add(camRight);
+                    if (input.left) steerAccel.sub(camRight);
+                    
+                    if (steerAccel.lengthSq() > 0) {
+                        steerAccel.normalize().multiplyScalar(30 * dt);
+                        // Only apply steering tangent to the rope
+                        steerAccel.sub(ropeVec.clone().multiplyScalar(steerAccel.dot(ropeVec)));
+                        player.vel.add(steerAccel);
+                    }
+                }
+
+                // Update Web Visuals
+                if (webLineMesh) {
+                    webLineMesh.visible = true;
+                    // Offset line to roughly where the hand is
+                    const handPos = player.pos.clone().add(new THREE.Vector3(0, 1, 0));
+                    const positions = webLineMesh.geometry.attributes.position.array;
+                    positions[0] = handPos.x; positions[1] = handPos.y; positions[2] = handPos.z;
+                    positions[3] = swingData.anchor.x; positions[4] = swingData.anchor.y; positions[5] = swingData.anchor.z;
+                    webLineMesh.geometry.attributes.position.needsUpdate = true;
+                }
+
+                // UI Speed lines based on velocity
+                const speed = player.vel.length();
+                ui.speed.style.boxShadow = speed > 50 ? `inset 0 0 ${speed}px rgba(255,255,255,0.4)` : 'none';
+
+            } else {
+                // Released Web / Free Fall
+                if (swingData.active) {
+                    // Release Impulse (Slingshot effect)
+                    // Final Velocity = Swing Vel + Forward Upward Burst
+                    player.vel.add(camDir.multiplyScalar(10));
+                    player.vel.y += 15; // Upward leap on release
+                    swingData.active = false;
+                    if (webLineMesh) webLineMesh.visible = false;
+                    changeState(PlayerStates.FALLING);
+                    ui.speed.style.boxShadow = 'none';
+                }
+
+                // Air Control
+                if (!player.isGrounded) {
+                    let airMove = new THREE.Vector3();
+                    if (input.forward) airMove.add(camDir);
+                    if (input.backward) airMove.sub(camDir);
+                    if (input.right) airMove.add(camRight);
+                    if (input.left) airMove.sub(camRight);
+                    if (airMove.lengthSq() > 0) {
+                        player.vel.add(airMove.normalize().multiplyScalar(15 * dt));
+                    }
+                    player.vel.x *= physics.airDrag;
+                    player.vel.z *= physics.airDrag;
+                } else {
+                    // Ground Movement
+                    let moveSpeed = 20;
+                    let groundMove = new THREE.Vector3();
+                    if (input.forward) groundMove.add(camDir);
+                    if (input.backward) groundMove.sub(camDir);
+                    if (input.right) groundMove.add(camRight);
+                    if (input.left) groundMove.sub(camRight);
+                    
+                    if (groundMove.lengthSq() > 0) {
+                        groundMove.normalize();
+                        player.vel.x = groundMove.x * moveSpeed;
+                        player.vel.z = groundMove.z * moveSpeed;
+                        changeState(PlayerStates.WALK);
+                    } else {
+                        player.vel.x *= physics.drag;
+                        player.vel.z *= physics.drag;
+                        changeState(PlayerStates.IDLE);
+                    }
+
+                    if (input.jumpPressed) {
+                        player.vel.y = 25;
+                        player.isGrounded = false;
+                        changeState(PlayerStates.JUMP);
+                    }
+                }
+            }
+
+            // Terminal Velocity check
+            if (player.vel.y < physics.terminalVelocity) player.vel.y = physics.terminalVelocity;
+
+            // Apply Velocity to Position
+            player.pos.addScaledVector(player.vel, dt);
+
+            // Simple Floor Collision
+            if (player.pos.y <= 0) {
+                player.pos.y = 0;
+                player.vel.y = 0;
+                if(player.state === PlayerStates.FALLING) {
+                    // Impact roll could go here
+                }
+                player.isGrounded = true;
+            } else {
+                player.isGrounded = false;
+            }
+
+            // Sync Model
+            if (playerModel) {
+                playerModel.position.copy(player.pos).add(player.modelOffset);
+                
+                // Rotation Logic: Face movement direction, or velocity when swinging
+                if (swingData.active && player.vel.lengthSq() > 1) {
+                    const lookTarget = player.pos.clone().add(player.vel);
+                    lookTarget.y = player.pos.y; // Keep upright
+                    playerModel.lookAt(lookTarget);
+                    // Add tilt based on turning
+                    playerModel.rotation.z = (input.right ? -0.2 : 0) + (input.left ? 0.2 : 0);
+                } else if (player.vel.x !== 0 || player.vel.z !== 0) {
+                    const angle = Math.atan2(player.vel.x, player.vel.z);
+                    // Smooth rotation interpolation
+                    const currentRot = playerModel.rotation.y;
+                    let diff = angle - currentRot;
+                    while (diff < -Math.PI) diff += Math.PI * 2;
+                    while (diff > Math.PI) diff -= Math.PI * 2;
+                    playerModel.rotation.y += diff * 10 * dt;
+                    playerModel.rotation.z = 0; // reset tilt
+                }
+            }
+        }
+
+        // --- Smooth Trailing Camera ---
+        function updateCamera(dt) {
+            if (!playerModel) return;
+            
+            // Base camera offset spherical coordinates
+            const distance = 10;
+            const height = 3;
+            
+            // Convert input camX/Y to Cartesian relative to player
+            const camOffsetX = distance * Math.cos(input.camY) * Math.sin(input.camX);
+            const camOffsetZ = distance * Math.cos(input.camY) * Math.cos(input.camX);
+            const camOffsetY = distance * Math.sin(input.camY) + height;
+
+            // Target position for the camera
+            const idealPos = new THREE.Vector3(
+                player.pos.x + camOffsetX,
+                player.pos.y + camOffsetY,
+                player.pos.z + camOffsetZ
+            );
+
+            // "Left to left" smooth trailing
+            // The camera lerps towards the ideal position, creating a lagging/trailing effect typical in WoS
+            const lerpSpeed = swingData.active ? 8 * dt : 15 * dt; // Smoother when swinging
+            camera.position.lerp(idealPos, lerpSpeed);
+
+            // Look slightly ahead of the player based on velocity
+            const lookTarget = player.pos.clone().add(new THREE.Vector3(0, 1.5, 0));
+            if (swingData.active) {
+                const velOffset = player.vel.clone().multiplyScalar(0.2); // Look ahead vector
+                lookTarget.add(velOffset);
+            }
+            
+            // Smooth lookat transition
+            const currentLook = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion).add(camera.position);
+            currentLook.lerp(lookTarget, 10 * dt);
+            camera.lookAt(currentLook);
+        }
+
+        function updateCombat() {
+            if (input.attackPressed) {
+                changeState(PlayerStates.FIGHT, 0.1);
+                combo++;
+                ui.combo.innerText = `${combo}x`;
+                comboTimer = 2.0; // 2 seconds to keep combo
+                
+                // Mini lunge forward
+                const camDir = new THREE.Vector3();
+                camera.getWorldDirection(camDir);
+                camDir.y = 0; camDir.normalize();
+                player.vel.add(camDir.multiplyScalar(5));
+            }
+
+            if (comboTimer > 0) {
+                comboTimer -= clock.getDelta();
+                if (comboTimer <= 0) {
+                    combo = 0;
+                    ui.combo.innerText = '';
+                }
+            }
+            // Reset input so it doesn't spam
+            input.attackPressed = false; 
+            input.jumpPressed = false;
+            input.swingPressed = false;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (gameState === 'playing') {
+                const dt = clock.getDelta();
+                updateGamepad();
+                updateCombat();
+                updatePhysics(dt);
+                updateCamera(dt);
+                if (mixer) mixer.update(dt);
+            }
+            
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            if (camera && renderer) {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            }
+        });
+    </script>
+</body>
+</html>
